@@ -1,0 +1,9 @@
+# udev rules for XREAL Air (NR-7100RGL) AR Glasses
+# Install: sudo cp 99-xreal-air.rules /etc/udev/rules.d/ && sudo udevadm control --reload-rules && sudo udevadm trigger
+
+# XREAL Air
+SUBSYSTEM=="hidraw", ATTRS{idVendor}=="3318", ATTRS{idProduct}=="0424", MODE="0666"
+# XREAL Air 2
+SUBSYSTEM=="hidraw", ATTRS{idVendor}=="3318", ATTRS{idProduct}=="0428", MODE="0666"
+# XREAL Air 2 Pro
+SUBSYSTEM=="hidraw", ATTRS{idVendor}=="3318", ATTRS{idProduct}=="0432", MODE="0666"

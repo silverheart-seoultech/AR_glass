@@ -152,7 +152,10 @@ class XREALAirIMU:
 
         # Madgwick filter state
         self._q = np.array([1.0, 0.0, 0.0, 0.0])  # quaternion [w,x,y,z]
-        self._beta = 0.1  # Madgwick filter gain
+        self._beta = 0.1  # Madgwick filter gain (steady-state)
+        self._beta_warmup = 2.5  # high gain for fast initial convergence
+        self._warmup_samples = 500  # ~0.5s at 1kHz
+        self._sample_idx = 0
         self._last_timestamp_us = None
 
     def _find_device_paths(self) -> tuple[Optional[str], Optional[str]]:
@@ -352,6 +355,8 @@ class XREALAirIMU:
 
     def _madgwick_update(self, imu: IMUData) -> Orientation:
         """Apply Madgwick AHRS filter to get orientation from accel+gyro."""
+        self._sample_idx += 1
+
         if self._last_timestamp_us is None:
             self._last_timestamp_us = imu.timestamp_us
             dt = 0.001  # default 1ms
@@ -361,6 +366,13 @@ class XREALAirIMU:
 
         if dt <= 0 or dt > 1.0:
             dt = 0.001
+
+        # Warmup: high beta for fast convergence, then settle to steady-state
+        if self._sample_idx <= self._warmup_samples:
+            t = self._sample_idx / self._warmup_samples  # 0→1
+            beta = self._beta_warmup + (self._beta - self._beta_warmup) * t
+        else:
+            beta = self._beta
 
         q = self._q.copy()
         w, x, y, z = q
@@ -402,7 +414,7 @@ class XREALAirIMU:
         ])
 
         # Apply correction
-        q_dot -= self._beta * j_t_f
+        q_dot -= beta * j_t_f
 
         # Integrate
         self._q = q + q_dot * dt

@@ -44,6 +44,26 @@ imu.stream(callback=on_imu, enable_fusion=True)
 imu.disconnect()
 ```
 
+## 3D 시각화로 검증
+
+```bash
+pip install matplotlib
+python3 -u visualize_imu.py
+```
+
+- 왼쪽: 글래스 방향을 따라 회전하는 3D 박스 (파란면 = 렌즈 방향)
+- 오른쪽: Roll/Pitch/Yaw 시계열 그래프
+
+검증 포인트:
+- 좌우 돌리기 → Yaw 변화, 끄덕이기 → Pitch 변화, 기울이기 → Roll 변화
+- 정지 시 `|a|` ≈ 9.8 m/s² 이면 가속도계 정상
+
+## 센서 퓨전 Warmup
+
+시작 직후 ~0.5초간 Madgwick 필터가 높은 보정 강도(β=2.5→0.1)로 현재 자세에 빠르게 수렴합니다.
+이후에는 안정적인 추적 모드(β=0.1)로 전환됩니다.
+글래스를 **정면을 바라본 상태**에서 시작하면 초기 기준점이 정확합니다.
+
 ## 트러블슈팅
 
 | 증상 | 해결 |
@@ -58,6 +78,8 @@ imu.disconnect()
 | 파일 | 설명 |
 |---|---|
 | `xreal_imu.py` | IMU 수신 + Madgwick 센서 퓨전 메인 코드 |
+| `visualize_imu.py` | 3D orientation 시각화 (matplotlib) |
+| `example_usage.py` | 콜백 사용 예제 (Pan-Tilt 모터 연동 등) |
 | `99-xreal-air.rules` | udev 권한 규칙 |
 | `requirements.txt` | Python 의존성 (numpy) |
 | `setup.sh` | 환경 자동 셋업 스크립트 |

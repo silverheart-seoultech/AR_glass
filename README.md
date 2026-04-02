@@ -51,6 +51,9 @@ pip install matplotlib
 python3 -u visualize_imu.py
 ```
 
+<img width="1400" height="600" alt="XREAL_Air_IMU_Visualizer" src="https://github.com/user-attachments/assets/0176b25a-ce43-47e4-810f-d070fc94553e" />
+
+
 - 왼쪽: 글래스 방향을 따라 회전하는 3D 박스 (파란면 = 렌즈 방향)
 - 오른쪽: Roll/Pitch/Yaw 시계열 그래프
 

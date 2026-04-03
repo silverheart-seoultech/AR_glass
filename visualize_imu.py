@@ -117,12 +117,27 @@ class IMUVisualizer:
             imu.disconnect()
             sys.exit(1)
 
-        print(f"[OK] Receiving data. Launching 3D view...\n")
+        print(f"[OK] Receiving data. Launching 3D view...")
+        print(f"     Press 'R' in the plot window to reset orientation (episode reset)\n")
 
         # ── Matplotlib 3D 시각화 ──
         plt.ion()
         fig = plt.figure(figsize=(14, 6))
         fig.canvas.manager.set_window_title("XREAL Air IMU Visualizer")
+
+        # Keyboard handler: 'r' = reset orientation
+        def on_key(event):
+            if event.key in ('r', 'R'):
+                imu.reset_orientation()
+                # Clear time series on reset
+                t_buf.clear()
+                roll_buf.clear()
+                pitch_buf.clear()
+                yaw_buf.clear()
+                nonlocal t_start
+                t_start = time.monotonic()
+
+        fig.canvas.mpl_connect('key_press_event', on_key)
 
         # 왼쪽: 3D 박스
         ax3d = fig.add_subplot(121, projection="3d")

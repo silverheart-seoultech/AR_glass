@@ -175,6 +175,7 @@ class XREALAirIMU:
         self._sample_idx = 0
         self._warmup_samples = 200  # ~0.2s at 1kHz
         self._calibrated = False
+        self._q_offset = None  # set by reset_orientation()
 
     def _find_device_paths(self) -> tuple[Optional[str], Optional[str]]:
         """Find hidraw device paths for IMU and MCU interfaces via sysfs."""
@@ -540,6 +541,25 @@ class XREALAirIMU:
         # Output convention: [roll=side tilt, pitch=nod, yaw=turn]
         return np.array([math.degrees(pitch), math.degrees(roll), math.degrees(yaw)])
 
+    def reset_orientation(self):
+        """
+        Reset orientation to identity (current pose becomes the new zero).
+        Call this at the start of each teleoperation episode.
+
+        After reset: Roll=0, Pitch=0, Yaw=0 at the current head pose.
+        """
+        q = self._x[0:4].copy()
+        # Store inverse of current quaternion as offset
+        self._q_offset = np.array([q[0], -q[1], -q[2], -q[3]])  # conjugate
+        self._q_offset /= np.linalg.norm(self._q_offset)
+        print("[RESET] Orientation zeroed at current pose")
+
+    def get_relative_orientation(self, q):
+        """Apply offset to get orientation relative to reset pose."""
+        if self._q_offset is not None:
+            return self._quat_mult(self._q_offset, q)
+        return q
+
     def _ekf_update(self, imu: IMUData) -> Orientation:
         """
         7-state EKF AHRS: state = [q(4), gyro_bias(3)]
@@ -699,8 +719,9 @@ class XREALAirIMU:
         self._x = x
         self._P = P
 
-        euler = self._quat_to_euler(x[0:4])
-        return Orientation(quaternion=x[0:4].copy(), euler_deg=euler)
+        q_out = self.get_relative_orientation(x[0:4])
+        euler = self._quat_to_euler(q_out)
+        return Orientation(quaternion=q_out.copy(), euler_deg=euler)
 
     def read_one(self, timeout_ms: int = 1000) -> Optional[IMUData]:
         """Read a single IMU sample. Returns None on timeout."""

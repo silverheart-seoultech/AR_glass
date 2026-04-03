@@ -174,6 +174,7 @@ class XREALAirIMU:
         self._last_timestamp_us = None
         self._sample_idx = 0
         self._warmup_samples = 200  # ~0.2s at 1kHz
+        self._calibrated = False
 
     def _find_device_paths(self) -> tuple[Optional[str], Optional[str]]:
         """Find hidraw device paths for IMU and MCU interfaces via sysfs."""
@@ -236,6 +237,99 @@ class XREALAirIMU:
             self._mcu_device.close()
             self._mcu_device = None
         print("[OK] Disconnected")
+
+    def calibrate_static(self, duration_sec: float = 1.5):
+        """
+        Static calibration: collect data while stationary to estimate
+        gyro bias and initial orientation from gravity.
+
+        Call this after connect(), before stream().
+        The glasses should be worn and the head held still.
+        """
+        if not self._imu_device:
+            raise RuntimeError("Not connected. Call connect() first.")
+
+        print(f"[CAL] Hold still for {duration_sec:.1f}s...")
+
+        self._send_imu_enable(True)
+        time.sleep(0.05)
+
+        gyro_samples = []
+        accel_samples = []
+        start = time.monotonic()
+
+        while time.monotonic() - start < duration_sec:
+            data = self._imu_device.read(64, timeout_ms=100)
+            if not data:
+                continue
+            imu = self._parse_imu_packet(data)
+            if imu is None:
+                continue
+            gyro_samples.append([imu.gyro_x, imu.gyro_y, imu.gyro_z])
+            accel_samples.append([imu.accel_x, imu.accel_y, imu.accel_z])
+
+        self._send_imu_enable(False)
+        time.sleep(0.05)
+        self._drain_buffer()
+
+        if len(gyro_samples) < 100:
+            print("[CAL] Not enough samples, skipping calibration")
+            return
+
+        gyro_arr = np.array(gyro_samples)
+        accel_arr = np.array(accel_samples)
+
+        # ── 1. Gyro bias: mean of stationary gyro readings ──
+        gyro_bias = gyro_arr.mean(axis=0)
+        gyro_std = gyro_arr.std(axis=0)
+
+        # ── 2. Initial orientation from gravity direction ──
+        accel_mean = accel_arr.mean(axis=0)
+        a_norm = np.linalg.norm(accel_mean)
+
+        if a_norm > 0.01:
+            # Gravity in body frame → compute Roll & Pitch
+            # (Yaw is unobservable from accel alone — set to 0)
+            ax, ay, az = accel_mean / a_norm
+
+            # We want: R(q) * [0,0,1] = [ax, ay, az]  (gravity direction)
+            pitch = math.asin(-ax)
+            roll = math.atan2(ay, az)
+            yaw = 0.0  # unobservable
+
+            # Euler → quaternion
+            cr, sr = math.cos(roll/2), math.sin(roll/2)
+            cp, sp = math.cos(pitch/2), math.sin(pitch/2)
+            cy, sy = math.cos(yaw/2), math.sin(yaw/2)
+
+            q0 = cr*cp*cy + sr*sp*sy
+            q1 = sr*cp*cy - cr*sp*sy
+            q2 = cr*sp*cy + sr*cp*sy
+            q3 = cr*cp*sy - sr*sp*cy
+
+            init_q = np.array([q0, q1, q2, q3])
+            init_q /= np.linalg.norm(init_q)
+        else:
+            init_q = np.array([1.0, 0.0, 0.0, 0.0])
+
+        # ── 3. Set EKF initial state ──
+        self._x[0:4] = init_q
+        self._x[4:7] = gyro_bias
+
+        # Tight initial covariance — we're confident in these values
+        self._P = np.eye(7) * 1e-4
+        self._P[4:, 4:] = np.eye(3) * (gyro_std ** 2).mean() * 0.1
+
+        # Skip warmup since we're already calibrated
+        self._calibrated = True
+
+        print(
+            f"[CAL] Done ({len(gyro_samples)} samples)\n"
+            f"      Gyro bias: ({gyro_bias[0]:+.5f}, {gyro_bias[1]:+.5f}, {gyro_bias[2]:+.5f}) rad/s\n"
+            f"      Gyro std:  ({gyro_std[0]:.5f}, {gyro_std[1]:.5f}, {gyro_std[2]:.5f}) rad/s\n"
+            f"      Init Roll: {math.degrees(roll):+.1f}°  Pitch: {math.degrees(pitch):+.1f}°\n"
+            f"      |accel|:   {a_norm:.3f} m/s² (expect ~{GRAVITY:.3f})"
+        )
 
     def _send_imu_enable(self, enable: bool):
         """Enable or disable IMU data streaming."""
@@ -544,8 +638,8 @@ class XREALAirIMU:
 
             # Adaptive R: scale up when accel deviates from gravity
             accel_dev = abs(a_norm - GRAVITY)
-            if self._sample_idx <= self._warmup_samples:
-                r_scale = 0.01  # trust accel heavily during warmup
+            if not self._calibrated and self._sample_idx <= self._warmup_samples:
+                r_scale = 0.01  # trust accel heavily during warmup (no calibration)
             elif accel_dev > 1.5:
                 r_scale = 100.0  # strong linear accel → distrust accel
             elif accel_dev > 0.3:
@@ -574,7 +668,8 @@ class XREALAirIMU:
         gyro_mag = np.linalg.norm(gyro)
         is_stationary = (accel_dev < 0.3) and (gyro_mag < 0.08)
 
-        if is_stationary and self._sample_idx > self._warmup_samples:
+        zupt_ready = self._calibrated or (self._sample_idx > self._warmup_samples)
+        if is_stationary and zupt_ready:
             # Measurement: gyro = bias + noise → z = gyro, h = bg
             z_zupt = gyro
             h_zupt = x[4:7]
@@ -693,13 +788,10 @@ def main():
         # Connect
         imu.connect()
 
-        # Calibration is disabled by default — the 38KB read destabilizes
-        # the device if interrupted. Enable with --calibration flag if needed.
-        if "--calibration" in sys.argv:
-            try:
-                imu.read_calibration()
-            except Exception as e:
-                print(f"[WARN] Calibration skipped: {e}")
+        # Static calibration: hold still for gyro bias + initial orientation
+        # Skip with --no-cal flag
+        if "--no-cal" not in sys.argv:
+            imu.calibrate_static(duration_sec=1.5)
 
         # Stream IMU data with sensor fusion
         print("\n--- Streaming IMU data (Ctrl+C to stop) ---\n")

@@ -90,6 +90,7 @@ class IMUVisualizer:
         imu = XREALAirIMU()
         try:
             imu.connect()
+            imu.calibrate_static(duration_sec=1.5)
         except ConnectionError as e:
             print(f"\n[ERROR] {e}")
             sys.exit(1)

@@ -54,11 +54,22 @@ FACE_COLORS = [
 def rotation_matrix_from_quat(q):
     """Quaternion [w,x,y,z] → 3x3 rotation matrix. No euler ambiguity."""
     w, x, y, z = q
-    return np.array([
+    R_sensor = np.array([
         [1 - 2*(y*y + z*z),   2*(x*y - w*z),     2*(x*z + w*y)],
         [2*(x*y + w*z),       1 - 2*(x*x + z*z), 2*(y*z - w*x)],
         [2*(x*z - w*y),       2*(y*z + w*x),     1 - 2*(x*x + y*y)],
     ])
+    # Remap so that identity quaternion shows the glasses box
+    # as upright and facing forward in the plot:
+    #   sensor X → plot -Z (forward/back)
+    #   sensor Y → plot  X (left/right)
+    #   sensor Z → plot  Y (up/down)
+    SENSOR_TO_VIEW = np.array([
+        [0,  1,  0],
+        [0,  0,  1],
+        [1,  0,  0],
+    ])
+    return SENSOR_TO_VIEW @ R_sensor @ SENSOR_TO_VIEW.T
 
 
 class IMUVisualizer:

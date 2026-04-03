@@ -324,12 +324,15 @@ class XREALAirIMU:
         # Skip warmup since we're already calibrated
         self._calibrated = True
 
+        # Auto-reset: calibration pose becomes (0,0,0)
+        self.reset_orientation()
+
         print(
             f"[CAL] Done ({len(gyro_samples)} samples)\n"
             f"      Gyro bias: ({gyro_bias[0]:+.5f}, {gyro_bias[1]:+.5f}, {gyro_bias[2]:+.5f}) rad/s\n"
             f"      Gyro std:  ({gyro_std[0]:.5f}, {gyro_std[1]:.5f}, {gyro_std[2]:.5f}) rad/s\n"
-            f"      Init Roll: {math.degrees(pitch):+.1f}°  Pitch: {math.degrees(roll):+.1f}°\n"
-            f"      |accel|:   {a_norm:.3f} m/s² (expect ~{GRAVITY:.3f})"
+            f"      |accel|:   {a_norm:.3f} m/s² (expect ~{GRAVITY:.3f})\n"
+            f"      Orientation zeroed → (0, 0, 0) at current pose"
         )
 
     def _send_imu_enable(self, enable: bool):

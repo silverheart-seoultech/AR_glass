@@ -51,25 +51,33 @@ FACE_COLORS = [
 ]
 
 
-def rotation_matrix_from_quat(q):
-    """Quaternion [w,x,y,z] → 3x3 rotation matrix. No euler ambiguity."""
-    w, x, y, z = q
-    R_sensor = np.array([
-        [1 - 2*(y*y + z*z),   2*(x*y - w*z),     2*(x*z + w*y)],
-        [2*(x*y + w*z),       1 - 2*(x*x + z*z), 2*(y*z - w*x)],
-        [2*(x*z - w*y),       2*(y*z + w*x),     1 - 2*(x*x + y*y)],
-    ])
-    # Remap so that identity quaternion shows the glasses box
-    # as upright and facing forward in the plot:
-    #   sensor X → plot -Z (forward/back)
-    #   sensor Y → plot  X (left/right)
-    #   sensor Z → plot  Y (up/down)
-    SENSOR_TO_VIEW = np.array([
-        [0,  1,  0],
-        [0,  0,  1],
-        [1,  0,  0],
-    ])
-    return SENSOR_TO_VIEW @ R_sensor @ SENSOR_TO_VIEW.T
+def rotation_matrix_from_euler(roll_deg, pitch_deg, yaw_deg):
+    """
+    Build rotation matrix from output euler angles.
+
+    Convention (matches xreal_imu.py output):
+      Roll  = side tilt  → rotation around Z (forward axis)
+      Pitch = nod up/down → rotation around X (right axis)
+      Yaw   = turn left/right → rotation around Y (up axis)
+
+    The box is defined with:
+      X = right, Y = up, Z = forward (into screen)
+    So at (0,0,0) the box is upright, facing forward.
+    """
+    r = np.radians(roll_deg)
+    p = np.radians(pitch_deg)
+    y = np.radians(yaw_deg)
+
+    cr, sr = np.cos(r), np.sin(r)
+    cp, sp = np.cos(p), np.sin(p)
+    cy, sy = np.cos(y), np.sin(y)
+
+    # Rz(roll) @ Rx(pitch) @ Ry(yaw)
+    Ry = np.array([[ cy, 0, sy], [0, 1, 0], [-sy, 0, cy]])   # yaw: around Y(up)
+    Rx = np.array([[1, 0, 0], [0, cp, -sp], [0, sp, cp]])     # pitch: around X(right)
+    Rz = np.array([[cr, -sr, 0], [sr, cr, 0], [0, 0, 1]])     # roll: around Z(forward)
+
+    return Ry @ Rx @ Rz
 
 
 class IMUVisualizer:
@@ -182,7 +190,7 @@ class IMUVisualizer:
 
                 # ── 3D 박스 업데이트 ──
                 ax3d.cla()
-                R = rotation_matrix_from_quat(quat)
+                R = rotation_matrix_from_euler(roll_d, pitch_d, yaw_d)
                 rotated = (R @ VERTICES.T).T
 
                 polys = [[rotated[v] for v in face] for face in FACES]

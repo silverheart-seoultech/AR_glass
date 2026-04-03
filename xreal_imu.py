@@ -332,7 +332,7 @@ class XREALAirIMU:
             f"      Gyro bias: ({gyro_bias[0]:+.5f}, {gyro_bias[1]:+.5f}, {gyro_bias[2]:+.5f}) rad/s\n"
             f"      Gyro std:  ({gyro_std[0]:.5f}, {gyro_std[1]:.5f}, {gyro_std[2]:.5f}) rad/s\n"
             f"      |accel|:   {a_norm:.3f} m/s² (expect ~{GRAVITY:.3f})\n"
-            f"      Orientation zeroed → (0, 0, 0) at current pose"
+            f"      Yaw zeroed, Roll/Pitch gravity-referenced"
         )
 
     def _send_imu_enable(self, enable: bool):
@@ -546,19 +546,31 @@ class XREALAirIMU:
 
     def reset_orientation(self):
         """
-        Reset orientation to identity (current pose becomes the new zero).
-        Call this at the start of each teleoperation episode.
+        Reset Yaw to zero while keeping gravity-referenced Roll/Pitch.
 
-        After reset: Roll=0, Pitch=0, Yaw=0 at the current head pose.
+        This is equivalent to VR/AR "Recenter" — only the horizontal
+        heading is reset. The vertical orientation (tilt/nod relative
+        to gravity) is preserved because it has an absolute reference.
+
+        After reset:
+          - Yaw = 0 at current heading direction
+          - Roll/Pitch = absolute angles relative to gravity
         """
         q = self._x[0:4].copy()
-        # Store inverse of current quaternion as offset
-        self._q_offset = np.array([q[0], -q[1], -q[2], -q[3]])  # conjugate
+        euler = self._quat_to_euler(q)  # [roll, pitch, yaw] in degrees
+
+        # Extract current yaw only (index 2 after swap)
+        yaw_rad = math.radians(euler[2])
+
+        # Build a yaw-only inverse quaternion (rotation around gravity axis)
+        cy, sy = math.cos(-yaw_rad / 2), math.sin(-yaw_rad / 2)
+        self._q_offset = np.array([cy, 0.0, 0.0, sy])
         self._q_offset /= np.linalg.norm(self._q_offset)
-        print("[RESET] Orientation zeroed at current pose")
+
+        print(f"[RESET] Yaw zeroed (was {euler[2]:+.1f}°), Roll/Pitch preserved (gravity-referenced)")
 
     def get_relative_orientation(self, q):
-        """Apply offset to get orientation relative to reset pose."""
+        """Apply yaw offset. Roll/Pitch pass through unchanged."""
         if self._q_offset is not None:
             return self._quat_mult(self._q_offset, q)
         return q

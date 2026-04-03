@@ -161,21 +161,15 @@ class XREALAirIMU:
         # q = orientation quaternion [w,x,y,z]
         # bg = gyroscope bias (rad/s)
         self._x = np.array([1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
-        self._P = np.eye(7) * 0.1  # state covariance
-        self._P[4:, 4:] = np.eye(3) * 0.01  # gyro bias initial uncertainty
+        self._P = np.eye(7) * 0.1
+        self._P[4:, 4:] = np.eye(3) * 0.01
 
-        # Process noise
-        self._q_gyro = 1e-4       # gyro noise (rad/s)²
-        self._q_gyro_bias = 1e-8  # gyro bias random walk
+        # Process noise (tuned for ICM-42688-P at 1kHz)
+        self._q_gyro = 5e-5       # gyro noise — lower = trust gyro more
+        self._q_gyro_bias = 1e-9  # bias random walk — very slow
 
-        # Measurement noise (base values, adaptively scaled)
-        self._r_accel = 0.5       # accel measurement noise
-        self._r_mag = 1.0         # mag measurement noise
-
-        # Reference magnetic field (learned from first valid samples)
-        self._mag_ref = None
-        self._mag_ref_samples = 0
-        self._mag_ref_accum = np.zeros(3)
+        # Measurement noise
+        self._r_accel = 1.0       # base accel noise (adaptively scaled)
 
         self._last_timestamp_us = None
         self._sample_idx = 0
@@ -575,64 +569,32 @@ class XREALAirIMU:
             IKH = np.eye(7) - K_a @ H_a
             P = IKH @ P @ IKH.T + K_a @ R_a @ K_a.T
 
-        # ════════════════════ UPDATE: MAGNETOMETER ════════════════════
-        if imu.mag_valid:
-            mag = np.array([imu.mag_x, imu.mag_y, imu.mag_z])
-            mag_norm = np.linalg.norm(mag)
+        # ════════════════════ UPDATE: ZUPT (gyro bias when stationary) ════
+        # When stationary: gyro should read zero → direct observation of bias
+        gyro_mag = np.linalg.norm(gyro)
+        is_stationary = (accel_dev < 0.3) and (gyro_mag < 0.08)
 
-            if mag_norm > 1.0:  # valid reading (µT)
-                # Learn magnetic reference from first stable samples
-                if self._mag_ref is None:
-                    if abs(a_norm - GRAVITY) < 0.5:  # only when stationary
-                        self._mag_ref_accum += mag
-                        self._mag_ref_samples += 1
-                        if self._mag_ref_samples >= 100:
-                            # Project reference to horizontal plane using current q
-                            avg_mag = self._mag_ref_accum / self._mag_ref_samples
-                            q_cur = x[0:4]
-                            mag_world = self._quat_rot(q_cur, avg_mag)
-                            # Keep only horizontal component (zero out vertical)
-                            self._mag_ref = np.array([
-                                math.sqrt(mag_world[0]**2 + mag_world[1]**2),
-                                0.0,
-                                mag_world[2],
-                            ])
-                            print(f"[OK] Magnetic reference set: {self._mag_ref}")
+        if is_stationary and self._sample_idx > self._warmup_samples:
+            # Measurement: gyro = bias + noise → z = gyro, h = bg
+            z_zupt = gyro
+            h_zupt = x[4:7]
+            y_z = z_zupt - h_zupt
 
-                if self._mag_ref is not None:
-                    q_cur = x[0:4]
-                    q_conj = np.array([q_cur[0], -q_cur[1], -q_cur[2], -q_cur[3]])
+            # Jacobian: d(gyro)/d(state) = [0(3x4), I(3x3)]
+            H_z = np.zeros((3, 7))
+            H_z[:, 4:7] = np.eye(3)
 
-                    # Expected mag in body frame
-                    h_mag = self._quat_rot(q_conj, self._mag_ref)
-                    h_mag_n = h_mag / np.linalg.norm(h_mag)
+            R_z = np.eye(3) * 1e-4  # tight: we're confident it's stationary
+            S_z = H_z @ P @ H_z.T + R_z
+            K_z = P @ H_z.T @ np.linalg.inv(S_z)
 
-                    z_mag = mag / mag_norm
+            dx = K_z @ y_z
+            x[0:4] += dx[0:4]
+            x[0:4] /= np.linalg.norm(x[0:4])
+            x[4:7] += dx[4:7]
 
-                    y_m = z_mag - h_mag_n
-
-                    # Numerical Jacobian
-                    H_m = np.zeros((3, 7))
-                    for j in range(4):
-                        x_plus = x.copy()
-                        x_plus[j] += eps
-                        x_plus[0:4] /= np.linalg.norm(x_plus[0:4])
-                        qc_p = np.array([x_plus[0], -x_plus[1], -x_plus[2], -x_plus[3]])
-                        mp = self._quat_rot(qc_p, self._mag_ref)
-                        mp_n = mp / np.linalg.norm(mp)
-                        H_m[:, j] = (mp_n - h_mag_n) / eps
-
-                    R_m = np.eye(3) * self._r_mag
-                    S_m = H_m @ P @ H_m.T + R_m
-                    K_m = P @ H_m.T @ np.linalg.inv(S_m)
-
-                    dx = K_m @ y_m
-                    x[0:4] += dx[0:4]
-                    x[0:4] /= np.linalg.norm(x[0:4])
-                    x[4:7] += dx[4:7]
-
-                    IKH = np.eye(7) - K_m @ H_m
-                    P = IKH @ P @ IKH.T + K_m @ R_m @ K_m.T
+            IKH = np.eye(7) - K_z @ H_z
+            P = IKH @ P @ IKH.T + K_z @ R_z @ K_z.T
 
         # ── Store state ──
         self._x = x

@@ -22,9 +22,9 @@ from xreal_imu import XREALAirIMU, IMUData, Orientation
 #   When identity quaternion (all angles=0):
 #   X = sensor X (remapped), Y = sensor Y, Z = sensor Z
 #
-# We define the box so that identity quaternion = glasses facing +Z
-# Wide along X (left-right), thin along Y (up-down), short along Z (front-back)
-W, H, D = 1.6, 0.3, 0.5  # width(X), depth(Y), height(Z)
+# Box shape: wide glasses facing +Z
+#   X = left-right (wide), Y = up-down (medium), Z = front-back (thin)
+W, H, D = 1.6, 0.5, 0.3  # width(X), height(Y), depth(Z)
 
 VERTICES = np.array([
     [-W/2, -H/2, -D/2],

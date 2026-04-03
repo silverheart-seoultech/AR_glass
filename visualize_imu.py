@@ -51,24 +51,20 @@ FACE_COLORS = [
 ]
 
 
-def rotation_matrix(roll, pitch, yaw):
-    """오일러각(rad) → 3x3 회전 행렬."""
-    cr, sr = np.cos(roll), np.sin(roll)
-    cp, sp = np.cos(pitch), np.sin(pitch)
-    cy, sy = np.cos(yaw), np.sin(yaw)
-
-    Rz = np.array([[cy, -sy, 0], [sy, cy, 0], [0, 0, 1]])
-    Ry = np.array([[cp, 0, sp], [0, 1, 0], [-sp, 0, cp]])
-    Rx = np.array([[1, 0, 0], [0, cr, -sr], [0, sr, cr]])
-
-    return Rz @ Ry @ Rx
+def rotation_matrix_from_quat(q):
+    """Quaternion [w,x,y,z] → 3x3 rotation matrix. No euler ambiguity."""
+    w, x, y, z = q
+    return np.array([
+        [1 - 2*(y*y + z*z),   2*(x*y - w*z),     2*(x*z + w*y)],
+        [2*(x*y + w*z),       1 - 2*(x*x + z*z), 2*(y*z - w*x)],
+        [2*(x*z - w*y),       2*(y*z + w*x),     1 - 2*(x*x + y*y)],
+    ])
 
 
 class IMUVisualizer:
     def __init__(self):
-        self.roll = 0.0
-        self.pitch = 0.0
-        self.yaw = 0.0
+        self.quat = np.array([1.0, 0.0, 0.0, 0.0])
+        self.euler_deg = np.zeros(3)  # [roll, pitch, yaw] in degrees
         self.gyro = np.zeros(3)
         self.accel = np.zeros(3)
         self.sample_count = 0
@@ -78,9 +74,8 @@ class IMUVisualizer:
 
     def imu_callback(self, imu_data: IMUData, orientation: Orientation):
         with self.lock:
-            self.roll = np.radians(orientation.euler_deg[0])
-            self.pitch = np.radians(orientation.euler_deg[1])
-            self.yaw = np.radians(orientation.euler_deg[2])
+            self.quat = orientation.quaternion.copy()
+            self.euler_deg = orientation.euler_deg.copy()
             self.gyro = np.array([imu_data.gyro_x, imu_data.gyro_y, imu_data.gyro_z])
             self.accel = np.array([imu_data.accel_x, imu_data.accel_y, imu_data.accel_z])
             self.sample_count += 1
@@ -159,12 +154,13 @@ class IMUVisualizer:
         try:
             while self._running:
                 with self.lock:
-                    roll = self.roll
-                    pitch = self.pitch
-                    yaw = self.yaw
+                    quat = self.quat.copy()
+                    euler = self.euler_deg.copy()
                     gyro = self.gyro.copy()
                     accel = self.accel.copy()
                     count = self.sample_count
+
+                roll_d, pitch_d, yaw_d = euler
 
                 # Hz 계산
                 now = time.monotonic()
@@ -175,7 +171,7 @@ class IMUVisualizer:
 
                 # ── 3D 박스 업데이트 ──
                 ax3d.cla()
-                R = rotation_matrix(roll, pitch, yaw)
+                R = rotation_matrix_from_quat(quat)
                 rotated = (R @ VERTICES.T).T
 
                 polys = [[rotated[v] for v in face] for face in FACES]
@@ -209,13 +205,13 @@ class IMUVisualizer:
                 ax3d.set_ylabel("Y")
                 ax3d.set_zlabel("Z")
                 ax3d.set_title(
-                    f"Roll: {np.degrees(roll):+6.1f}°  "
-                    f"Pitch: {np.degrees(pitch):+6.1f}°  "
-                    f"Yaw: {np.degrees(yaw):+6.1f}°\n"
+                    f"Roll(tilt): {roll_d:+6.1f}°  "
+                    f"Pitch(nod): {pitch_d:+6.1f}°  "
+                    f"Yaw(turn): {yaw_d:+6.1f}°\n"
                     f"Gyro: ({gyro[0]:+.3f}, {gyro[1]:+.3f}, {gyro[2]:+.3f}) rad/s\n"
                     f"Accel: ({accel[0]:+.2f}, {accel[1]:+.2f}, {accel[2]:+.2f}) m/s²  "
                     f"|a|={np.linalg.norm(accel):.2f}\n"
-                    f"{self.hz:.0f} Hz",
+                    f"{self.hz:.0f} Hz  [R=reset]",
                     fontsize=9, family="monospace",
                 )
                 ax3d.view_init(elev=20, azim=-60)
@@ -223,9 +219,9 @@ class IMUVisualizer:
                 # ── 오일러각 시계열 ──
                 elapsed = now - t_start
                 t_buf.append(elapsed)
-                roll_buf.append(np.degrees(roll))
-                pitch_buf.append(np.degrees(pitch))
-                yaw_buf.append(np.degrees(yaw))
+                roll_buf.append(roll_d)
+                pitch_buf.append(pitch_d)
+                yaw_buf.append(yaw_d)
 
                 # 버퍼 제한
                 if len(t_buf) > max_points:
@@ -235,9 +231,9 @@ class IMUVisualizer:
                     yaw_buf[:] = yaw_buf[-max_points:]
 
                 ax_euler.cla()
-                ax_euler.plot(t_buf, roll_buf, "r-", linewidth=1.2, label="Roll")
-                ax_euler.plot(t_buf, pitch_buf, "g-", linewidth=1.2, label="Pitch")
-                ax_euler.plot(t_buf, yaw_buf, "b-", linewidth=1.2, label="Yaw")
+                ax_euler.plot(t_buf, roll_buf, "r-", linewidth=1.2, label="Roll (tilt)")
+                ax_euler.plot(t_buf, pitch_buf, "g-", linewidth=1.2, label="Pitch (nod)")
+                ax_euler.plot(t_buf, yaw_buf, "b-", linewidth=1.2, label="Yaw (turn)")
                 ax_euler.set_xlabel("Time (s)")
                 ax_euler.set_ylabel("Angle (°)")
                 ax_euler.set_title("Euler Angles Over Time")

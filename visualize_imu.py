@@ -17,19 +17,24 @@ from mpl_toolkits.mplot3d.art3d import Poly3DCollection
 from xreal_imu import XREALAirIMU, IMUData, Orientation
 
 
-# ── 글래스 형태의 3D 꼭짓점 (안경 모양) ──────────────────────────
-# 가로 넓고, 세로 낮고, 앞뒤 얇은 박스
-W, H, D = 1.6, 0.5, 0.3  # width, height, depth
+# ── 글래스 형태의 3D 꼭짓점 ──────────────────────────
+# Sensor coordinate system (from IMU data after reset):
+#   When identity quaternion (all angles=0):
+#   X = sensor X (remapped), Y = sensor Y, Z = sensor Z
+#
+# We define the box so that identity quaternion = glasses facing +Z
+# Wide along X (left-right), thin along Y (up-down), short along Z (front-back)
+W, H, D = 1.6, 0.3, 0.5  # width(X), depth(Y), height(Z)
 
 VERTICES = np.array([
-    [-W/2, -H/2, -D/2],  # 0: left-bottom-back
-    [+W/2, -H/2, -D/2],  # 1: right-bottom-back
-    [+W/2, +H/2, -D/2],  # 2: right-top-back
-    [-W/2, +H/2, -D/2],  # 3: left-top-back
-    [-W/2, -H/2, +D/2],  # 4: left-bottom-front
-    [+W/2, -H/2, +D/2],  # 5: right-bottom-front
-    [+W/2, +H/2, +D/2],  # 6: right-top-front
-    [-W/2, +H/2, +D/2],  # 7: left-top-front
+    [-W/2, -H/2, -D/2],
+    [+W/2, -H/2, -D/2],
+    [+W/2, +H/2, -D/2],
+    [-W/2, +H/2, -D/2],
+    [-W/2, -H/2, +D/2],
+    [+W/2, -H/2, +D/2],
+    [+W/2, +H/2, +D/2],
+    [-W/2, +H/2, +D/2],
 ])
 
 FACES = [
@@ -51,33 +56,24 @@ FACE_COLORS = [
 ]
 
 
-def rotation_matrix_from_euler(roll_deg, pitch_deg, yaw_deg):
+def rotation_matrix_from_quat(q):
     """
-    Build rotation matrix from output euler angles.
+    Quaternion [w,x,y,z] → 3x3 rotation matrix for visualization.
 
-    Convention (matches xreal_imu.py output):
-      Roll  = side tilt  → rotation around Z (forward axis)
-      Pitch = nod up/down → rotation around X (right axis)
-      Yaw   = turn left/right → rotation around Y (up axis)
-
-    The box is defined with:
-      X = right, Y = up, Z = forward (into screen)
-    So at (0,0,0) the box is upright, facing forward.
+    Uses the quaternion directly (no euler decomposition issues).
+    Applies a fixed remap so that the box displays as:
+      - (0,0,0) orientation = box upright, facing forward
+      - Pitch(nod) = box tilts forward/backward
+      - Roll(tilt) = box tilts left/right
+      - Yaw(turn)  = box rotates left/right
     """
-    r = np.radians(roll_deg)
-    p = np.radians(pitch_deg)
-    y = np.radians(yaw_deg)
-
-    cr, sr = np.cos(r), np.sin(r)
-    cp, sp = np.cos(p), np.sin(p)
-    cy, sy = np.cos(y), np.sin(y)
-
-    # Rz(roll) @ Rx(pitch) @ Ry(yaw)
-    Ry = np.array([[ cy, 0, sy], [0, 1, 0], [-sy, 0, cy]])   # yaw: around Y(up)
-    Rx = np.array([[1, 0, 0], [0, cp, -sp], [0, sp, cp]])     # pitch: around X(right)
-    Rz = np.array([[cr, -sr, 0], [sr, cr, 0], [0, 0, 1]])     # roll: around Z(forward)
-
-    return Ry @ Rx @ Rz
+    w, x, y, z = q
+    R = np.array([
+        [1 - 2*(y*y + z*z),   2*(x*y - w*z),     2*(x*z + w*y)],
+        [2*(x*y + w*z),       1 - 2*(x*x + z*z), 2*(y*z - w*x)],
+        [2*(x*z - w*y),       2*(y*z + w*x),     1 - 2*(x*x + y*y)],
+    ])
+    return R
 
 
 class IMUVisualizer:
@@ -190,7 +186,7 @@ class IMUVisualizer:
 
                 # ── 3D 박스 업데이트 ──
                 ax3d.cla()
-                R = rotation_matrix_from_euler(roll_d, pitch_d, yaw_d)
+                R = rotation_matrix_from_quat(quat)
                 rotated = (R @ VERTICES.T).T
 
                 polys = [[rotated[v] for v in face] for face in FACES]

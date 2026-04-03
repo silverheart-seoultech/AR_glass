@@ -51,13 +51,20 @@ class IMUData:
     accel_x: float  # m/s^2
     accel_y: float  # m/s^2
     accel_z: float  # m/s^2
+    mag_x: float = 0.0  # µT (micro-Tesla)
+    mag_y: float = 0.0
+    mag_z: float = 0.0
+    mag_valid: bool = False
 
     def __str__(self):
-        return (
+        s = (
             f"t={self.timestamp_us:>12d}us | "
             f"Gyro: ({self.gyro_x:+8.4f}, {self.gyro_y:+8.4f}, {self.gyro_z:+8.4f}) rad/s | "
             f"Accel: ({self.accel_x:+8.3f}, {self.accel_y:+8.3f}, {self.accel_z:+8.3f}) m/s²"
         )
+        if self.mag_valid:
+            s += f" | Mag: ({self.mag_x:+7.1f}, {self.mag_y:+7.1f}, {self.mag_z:+7.1f}) µT"
+        return s
 
 
 @dataclass
@@ -150,21 +157,29 @@ class XREALAirIMU:
         self._running = False
         self._calibration = None
 
-        # Madgwick filter state
-        self._q = np.array([1.0, 0.0, 0.0, 0.0])  # quaternion [w,x,y,z]
-        self._beta = 0.1  # Madgwick filter gain (steady-state)
-        self._beta_warmup = 2.5  # high gain for fast initial convergence
-        self._warmup_samples = 500  # ~0.5s at 1kHz
-        self._sample_idx = 0
+        # ── EKF State: [q0, q1, q2, q3, bg_x, bg_y, bg_z] ──
+        # q = orientation quaternion [w,x,y,z]
+        # bg = gyroscope bias (rad/s)
+        self._x = np.array([1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+        self._P = np.eye(7) * 0.1  # state covariance
+        self._P[4:, 4:] = np.eye(3) * 0.01  # gyro bias initial uncertainty
+
+        # Process noise
+        self._q_gyro = 1e-4       # gyro noise (rad/s)²
+        self._q_gyro_bias = 1e-8  # gyro bias random walk
+
+        # Measurement noise (base values, adaptively scaled)
+        self._r_accel = 0.5       # accel measurement noise
+        self._r_mag = 1.0         # mag measurement noise
+
+        # Reference magnetic field (learned from first valid samples)
+        self._mag_ref = None
+        self._mag_ref_samples = 0
+        self._mag_ref_accum = np.zeros(3)
+
         self._last_timestamp_us = None
-
-        # Adaptive beta: reduce accel correction during linear motion
-        self._accel_lp = GRAVITY  # low-pass filtered accel magnitude
-        self._accel_lp_alpha = 0.01  # LP filter coefficient (slow tracking)
-
-        # Gyro bias estimation (zero-velocity update)
-        self._gyro_bias = np.zeros(3)
-        self._gyro_bias_alpha = 0.0001  # very slow adaptation
+        self._sample_idx = 0
+        self._warmup_samples = 200  # ~0.2s at 1kHz
 
     def _find_device_paths(self) -> tuple[Optional[str], Optional[str]]:
         """Find hidraw device paths for IMU and MCU interfaces via sysfs."""
@@ -355,134 +370,276 @@ class XREALAirIMU:
                 accel_y -= accel_bias[1]
                 accel_z -= accel_bias[2]
 
+        # Magnetometer (big-endian multiplier/divisor, bizarre i16 encoding)
+        mag_x, mag_y, mag_z = 0.0, 0.0, 0.0
+        mag_valid = False
+        if len(data) >= 54:
+            mag_mul = struct.unpack_from(">H", bytes(data), 42)[0]
+            mag_div = struct.unpack_from(">I", bytes(data), 44)[0]
+            if mag_div != 0 and mag_mul != 0:
+                def _bizarre_i16(d, off):
+                    """XOR 0x80 on high byte, then interpret as signed i16."""
+                    lo = d[off]
+                    hi = d[off + 1] ^ 0x80
+                    return struct.unpack("<h", bytes([lo, hi]))[0]
+
+                mag_x_raw = _bizarre_i16(data, 48)
+                mag_y_raw = _bizarre_i16(data, 50)
+                mag_z_raw = _bizarre_i16(data, 52)
+
+                mag_scale = mag_mul / mag_div
+                # Axis remapping (same as accel/gyro)
+                mag_x = -mag_x_raw * mag_scale
+                mag_y = mag_z_raw * mag_scale
+                mag_z = mag_y_raw * mag_scale
+                mag_valid = True
+
         return IMUData(
             timestamp_us=timestamp_us,
             gyro_x=gyro_x, gyro_y=gyro_y, gyro_z=gyro_z,
             accel_x=accel_x, accel_y=accel_y, accel_z=accel_z,
+            mag_x=mag_x, mag_y=mag_y, mag_z=mag_z, mag_valid=mag_valid,
         )
 
-    def _madgwick_update(self, imu: IMUData) -> Orientation:
-        """Apply Madgwick AHRS filter to get orientation from accel+gyro."""
-        self._sample_idx += 1
-
-        if self._last_timestamp_us is None:
-            self._last_timestamp_us = imu.timestamp_us
-            dt = 0.001  # default 1ms
-        else:
-            dt = (imu.timestamp_us - self._last_timestamp_us) / 1_000_000.0
-            self._last_timestamp_us = imu.timestamp_us
-
-        if dt <= 0 or dt > 1.0:
-            dt = 0.001
-
-        # Warmup: high beta for fast convergence, then settle to steady-state
-        if self._sample_idx <= self._warmup_samples:
-            t = self._sample_idx / self._warmup_samples  # 0→1
-            beta = self._beta_warmup + (self._beta - self._beta_warmup) * t
-        else:
-            beta = self._beta
-
-        q = self._q.copy()
-        w, x, y, z = q
-
-        gx, gy, gz = imu.gyro_x, imu.gyro_y, imu.gyro_z
-        ax, ay, az = imu.accel_x, imu.accel_y, imu.accel_z
-
-        # ── Gyro bias estimation (ZUPT: zero-velocity update) ──
-        # When nearly stationary, slowly learn gyro bias
-        a_norm = math.sqrt(ax * ax + ay * ay + az * az)
-        gyro_mag = math.sqrt(gx * gx + gy * gy + gz * gz)
-
-        is_stationary = (abs(a_norm - GRAVITY) < 0.3) and (gyro_mag < 0.05)
-        if is_stationary and self._sample_idx > self._warmup_samples:
-            self._gyro_bias += self._gyro_bias_alpha * (
-                np.array([gx, gy, gz]) - self._gyro_bias
-            )
-
-        # Apply gyro bias correction
-        gx -= self._gyro_bias[0]
-        gy -= self._gyro_bias[1]
-        gz -= self._gyro_bias[2]
-
-        # ── Adaptive beta: suppress accel correction during linear motion ──
-        # If |accel| deviates from gravity, the body is accelerating linearly
-        # → accel no longer points at gravity → reduce its influence
-        self._accel_lp += self._accel_lp_alpha * (a_norm - self._accel_lp)
-        accel_dev = abs(a_norm - GRAVITY)
-
-        if self._sample_idx > self._warmup_samples:
-            if accel_dev > 1.5:
-                # Strong linear accel: trust only gyro
-                beta = beta * 0.01
-            elif accel_dev > 0.5:
-                # Moderate: scale down proportionally
-                scale = 1.0 - (accel_dev - 0.5) / 1.0
-                beta = beta * max(scale, 0.01)
-
-        # Normalize accelerometer
-        if a_norm > 0.01:
-            ax /= a_norm
-            ay /= a_norm
-            az /= a_norm
-
-            # Gradient descent corrective step
-            f1 = 2.0 * (x * z - w * y) - ax
-            f2 = 2.0 * (w * x + y * z) - ay
-            f3 = 2.0 * (0.5 - x * x - y * y) - az
-
-            j_t_f = np.array([
-                -2.0 * y * f1 + 2.0 * x * f2,
-                2.0 * z * f1 + 2.0 * w * f2 - 4.0 * x * f3,
-                -2.0 * w * f1 + 2.0 * z * f2 - 4.0 * y * f3,
-                2.0 * x * f1 + 2.0 * y * f2,
-            ])
-
-            grad_norm = np.linalg.norm(j_t_f)
-            if grad_norm > 0:
-                j_t_f /= grad_norm
-        else:
-            j_t_f = np.zeros(4)
-
-        # Quaternion rate from gyroscope
-        q_dot = 0.5 * np.array([
-            -x * gx - y * gy - z * gz,
-            w * gx + y * gz - z * gy,
-            w * gy - x * gz + z * gx,
-            w * gz + x * gy - y * gx,
+    @staticmethod
+    def _quat_mult(a, b):
+        """Hamilton quaternion product [w,x,y,z]."""
+        return np.array([
+            a[0]*b[0] - a[1]*b[1] - a[2]*b[2] - a[3]*b[3],
+            a[0]*b[1] + a[1]*b[0] + a[2]*b[3] - a[3]*b[2],
+            a[0]*b[2] - a[1]*b[3] + a[2]*b[0] + a[3]*b[1],
+            a[0]*b[3] + a[1]*b[2] - a[2]*b[1] + a[3]*b[0],
         ])
 
-        # Apply correction
-        q_dot -= beta * j_t_f
+    @staticmethod
+    def _quat_rot(q, v):
+        """Rotate vector v by quaternion q: q ⊗ [0,v] ⊗ q*."""
+        qv = np.array([0.0, v[0], v[1], v[2]])
+        qc = np.array([q[0], -q[1], -q[2], -q[3]])
+        tmp = np.array([
+            q[0]*qv[0] - q[1]*qv[1] - q[2]*qv[2] - q[3]*qv[3],
+            q[0]*qv[1] + q[1]*qv[0] + q[2]*qv[3] - q[3]*qv[2],
+            q[0]*qv[2] - q[1]*qv[3] + q[2]*qv[0] + q[3]*qv[1],
+            q[0]*qv[3] + q[1]*qv[2] - q[2]*qv[1] + q[3]*qv[0],
+        ])
+        res = np.array([
+            tmp[0]*qc[0] - tmp[1]*qc[1] - tmp[2]*qc[2] - tmp[3]*qc[3],
+            tmp[0]*qc[1] + tmp[1]*qc[0] + tmp[2]*qc[3] - tmp[3]*qc[2],
+            tmp[0]*qc[2] - tmp[1]*qc[3] + tmp[2]*qc[0] + tmp[3]*qc[1],
+            tmp[0]*qc[3] + tmp[1]*qc[2] - tmp[2]*qc[1] + tmp[3]*qc[0],
+        ])
+        return res[1:4]
 
-        # Integrate
-        self._q = q + q_dot * dt
-
-        # Normalize quaternion
-        q_norm = np.linalg.norm(self._q)
-        if q_norm > 0:
-            self._q /= q_norm
-
-        # Convert to Euler angles (degrees)
-        w, x, y, z = self._q
-        sinr_cosp = 2.0 * (w * x + y * z)
-        cosr_cosp = 1.0 - 2.0 * (x * x + y * y)
-        roll = math.atan2(sinr_cosp, cosr_cosp)
+    @staticmethod
+    def _quat_to_euler(q):
+        """Quaternion [w,x,y,z] → Euler [roll, pitch, yaw] in degrees."""
+        w, x, y, z = q
+        sinr = 2.0 * (w * x + y * z)
+        cosr = 1.0 - 2.0 * (x * x + y * y)
+        roll = math.atan2(sinr, cosr)
 
         sinp = 2.0 * (w * y - z * x)
         sinp = max(-1.0, min(1.0, sinp))
         pitch = math.asin(sinp)
 
-        siny_cosp = 2.0 * (w * z + x * y)
-        cosy_cosp = 1.0 - 2.0 * (y * y + z * z)
-        yaw = math.atan2(siny_cosp, cosy_cosp)
+        siny = 2.0 * (w * z + x * y)
+        cosy = 1.0 - 2.0 * (y * y + z * z)
+        yaw = math.atan2(siny, cosy)
 
-        euler_deg = np.array([
-            math.degrees(roll),
-            math.degrees(pitch),
-            math.degrees(yaw),
+        return np.array([math.degrees(roll), math.degrees(pitch), math.degrees(yaw)])
+
+    def _ekf_update(self, imu: IMUData) -> Orientation:
+        """
+        7-state EKF AHRS: state = [q(4), gyro_bias(3)]
+
+        Predict:  quaternion integration with bias-corrected gyro
+        Update 1: accelerometer → gravity direction (Roll/Pitch)
+        Update 2: magnetometer → magnetic north (Yaw) — if available
+
+        Adaptive: measurement noise scaled by accel deviation from gravity
+        """
+        self._sample_idx += 1
+
+        # ── dt ──
+        if self._last_timestamp_us is None:
+            self._last_timestamp_us = imu.timestamp_us
+            dt = 0.001
+        else:
+            dt = (imu.timestamp_us - self._last_timestamp_us) / 1_000_000.0
+            self._last_timestamp_us = imu.timestamp_us
+        if dt <= 0 or dt > 1.0:
+            dt = 0.001
+
+        x = self._x.copy()
+        P = self._P.copy()
+        q = x[0:4]
+        bg = x[4:7]
+
+        gyro = np.array([imu.gyro_x, imu.gyro_y, imu.gyro_z])
+        accel = np.array([imu.accel_x, imu.accel_y, imu.accel_z])
+
+        # ════════════════════ PREDICT ════════════════════
+        # Bias-corrected angular velocity
+        w_corr = gyro - bg
+
+        # Quaternion derivative: q_dot = 0.5 * q ⊗ [0, w_corr]
+        wx, wy, wz = w_corr
+        Omega = 0.5 * np.array([
+            [0,  -wx, -wy, -wz],
+            [wx,  0,   wz, -wy],
+            [wy, -wz,  0,   wx],
+            [wz,  wy, -wx,  0 ],
         ])
 
-        return Orientation(quaternion=self._q.copy(), euler_deg=euler_deg)
+        # Integrate quaternion
+        q_new = q + Omega @ q * dt
+        q_new /= np.linalg.norm(q_new)
+
+        # State transition Jacobian F (7x7)
+        F = np.eye(7)
+        F[0:4, 0:4] = np.eye(4) + Omega * dt
+
+        # d(q_dot)/d(bg) = -0.5 * [q]_right * I_ext * dt
+        # Simplified: bias affects quaternion through gyro
+        qw, qx, qy, qz = q
+        dq_dbg = -0.5 * dt * np.array([
+            [-qx, -qy, -qz],
+            [ qw,  qz, -qy],
+            [-qz,  qw,  qx],
+            [ qy, -qx,  qw],
+        ])
+        F[0:4, 4:7] = dq_dbg
+
+        # Process noise Q
+        Q = np.zeros((7, 7))
+        Q[0:4, 0:4] = np.eye(4) * self._q_gyro * dt * dt
+        Q[4:7, 4:7] = np.eye(3) * self._q_gyro_bias * dt
+
+        # Predicted state and covariance
+        x[0:4] = q_new
+        # bg stays the same (random walk model)
+        P = F @ P @ F.T + Q
+
+        # ════════════════════ UPDATE: ACCELEROMETER ════════════════════
+        a_norm = np.linalg.norm(accel)
+        if a_norm > 0.01:
+            # Expected gravity in body frame: R(q)^T * [0,0,g]
+            # = rotate [0,0,1] by q_conjugate
+            q_conj = np.array([q_new[0], -q_new[1], -q_new[2], -q_new[3]])
+            g_body = self._quat_rot(q_conj, np.array([0.0, 0.0, GRAVITY]))
+
+            # Measurement: normalized accel
+            z_accel = accel / a_norm
+            h_accel = g_body / np.linalg.norm(g_body)
+
+            # Innovation
+            y_a = z_accel - h_accel
+
+            # Jacobian H_accel (3x7): d(h_accel)/d(state)
+            # Approximated numerically for robustness
+            H_a = np.zeros((3, 7))
+            eps = 1e-6
+            for j in range(4):
+                x_plus = x.copy()
+                x_plus[j] += eps
+                x_plus[0:4] /= np.linalg.norm(x_plus[0:4])
+                qc_p = np.array([x_plus[0], -x_plus[1], -x_plus[2], -x_plus[3]])
+                gp = self._quat_rot(qc_p, np.array([0.0, 0.0, GRAVITY]))
+                gp_n = gp / np.linalg.norm(gp)
+                H_a[:, j] = (gp_n - h_accel) / eps
+
+            # Adaptive R: scale up when accel deviates from gravity
+            accel_dev = abs(a_norm - GRAVITY)
+            if self._sample_idx <= self._warmup_samples:
+                r_scale = 0.01  # trust accel heavily during warmup
+            elif accel_dev > 1.5:
+                r_scale = 100.0  # strong linear accel → distrust accel
+            elif accel_dev > 0.3:
+                r_scale = 1.0 + (accel_dev - 0.3) / 1.2 * 99.0
+            else:
+                r_scale = 1.0
+
+            R_a = np.eye(3) * self._r_accel * r_scale
+
+            # Kalman gain
+            S_a = H_a @ P @ H_a.T + R_a
+            K_a = P @ H_a.T @ np.linalg.inv(S_a)
+
+            # State update
+            dx = K_a @ y_a
+            x[0:4] += dx[0:4]
+            x[0:4] /= np.linalg.norm(x[0:4])
+            x[4:7] += dx[4:7]
+
+            # Covariance update (Joseph form for numerical stability)
+            IKH = np.eye(7) - K_a @ H_a
+            P = IKH @ P @ IKH.T + K_a @ R_a @ K_a.T
+
+        # ════════════════════ UPDATE: MAGNETOMETER ════════════════════
+        if imu.mag_valid:
+            mag = np.array([imu.mag_x, imu.mag_y, imu.mag_z])
+            mag_norm = np.linalg.norm(mag)
+
+            if mag_norm > 1.0:  # valid reading (µT)
+                # Learn magnetic reference from first stable samples
+                if self._mag_ref is None:
+                    if abs(a_norm - GRAVITY) < 0.5:  # only when stationary
+                        self._mag_ref_accum += mag
+                        self._mag_ref_samples += 1
+                        if self._mag_ref_samples >= 100:
+                            # Project reference to horizontal plane using current q
+                            avg_mag = self._mag_ref_accum / self._mag_ref_samples
+                            q_cur = x[0:4]
+                            mag_world = self._quat_rot(q_cur, avg_mag)
+                            # Keep only horizontal component (zero out vertical)
+                            self._mag_ref = np.array([
+                                math.sqrt(mag_world[0]**2 + mag_world[1]**2),
+                                0.0,
+                                mag_world[2],
+                            ])
+                            print(f"[OK] Magnetic reference set: {self._mag_ref}")
+
+                if self._mag_ref is not None:
+                    q_cur = x[0:4]
+                    q_conj = np.array([q_cur[0], -q_cur[1], -q_cur[2], -q_cur[3]])
+
+                    # Expected mag in body frame
+                    h_mag = self._quat_rot(q_conj, self._mag_ref)
+                    h_mag_n = h_mag / np.linalg.norm(h_mag)
+
+                    z_mag = mag / mag_norm
+
+                    y_m = z_mag - h_mag_n
+
+                    # Numerical Jacobian
+                    H_m = np.zeros((3, 7))
+                    for j in range(4):
+                        x_plus = x.copy()
+                        x_plus[j] += eps
+                        x_plus[0:4] /= np.linalg.norm(x_plus[0:4])
+                        qc_p = np.array([x_plus[0], -x_plus[1], -x_plus[2], -x_plus[3]])
+                        mp = self._quat_rot(qc_p, self._mag_ref)
+                        mp_n = mp / np.linalg.norm(mp)
+                        H_m[:, j] = (mp_n - h_mag_n) / eps
+
+                    R_m = np.eye(3) * self._r_mag
+                    S_m = H_m @ P @ H_m.T + R_m
+                    K_m = P @ H_m.T @ np.linalg.inv(S_m)
+
+                    dx = K_m @ y_m
+                    x[0:4] += dx[0:4]
+                    x[0:4] /= np.linalg.norm(x[0:4])
+                    x[4:7] += dx[4:7]
+
+                    IKH = np.eye(7) - K_m @ H_m
+                    P = IKH @ P @ IKH.T + K_m @ R_m @ K_m.T
+
+        # ── Store state ──
+        self._x = x
+        self._P = P
+
+        euler = self._quat_to_euler(x[0:4])
+        return Orientation(quaternion=x[0:4].copy(), euler_deg=euler)
 
     def read_one(self, timeout_ms: int = 1000) -> Optional[IMUData]:
         """Read a single IMU sample. Returns None on timeout."""
@@ -536,7 +693,7 @@ class XREALAirIMU:
 
                 orientation = None
                 if enable_fusion:
-                    orientation = self._madgwick_update(imu)
+                    orientation = self._ekf_update(imu)
 
                 sample_count += 1
 

@@ -158,6 +158,14 @@ class XREALAirIMU:
         self._sample_idx = 0
         self._last_timestamp_us = None
 
+        # Adaptive beta: reduce accel correction during linear motion
+        self._accel_lp = GRAVITY  # low-pass filtered accel magnitude
+        self._accel_lp_alpha = 0.01  # LP filter coefficient (slow tracking)
+
+        # Gyro bias estimation (zero-velocity update)
+        self._gyro_bias = np.zeros(3)
+        self._gyro_bias_alpha = 0.0001  # very slow adaptation
+
     def _find_device_paths(self) -> tuple[Optional[str], Optional[str]]:
         """Find hidraw device paths for IMU and MCU interfaces via sysfs."""
         import re
@@ -380,8 +388,38 @@ class XREALAirIMU:
         gx, gy, gz = imu.gyro_x, imu.gyro_y, imu.gyro_z
         ax, ay, az = imu.accel_x, imu.accel_y, imu.accel_z
 
-        # Normalize accelerometer
+        # ── Gyro bias estimation (ZUPT: zero-velocity update) ──
+        # When nearly stationary, slowly learn gyro bias
         a_norm = math.sqrt(ax * ax + ay * ay + az * az)
+        gyro_mag = math.sqrt(gx * gx + gy * gy + gz * gz)
+
+        is_stationary = (abs(a_norm - GRAVITY) < 0.3) and (gyro_mag < 0.05)
+        if is_stationary and self._sample_idx > self._warmup_samples:
+            self._gyro_bias += self._gyro_bias_alpha * (
+                np.array([gx, gy, gz]) - self._gyro_bias
+            )
+
+        # Apply gyro bias correction
+        gx -= self._gyro_bias[0]
+        gy -= self._gyro_bias[1]
+        gz -= self._gyro_bias[2]
+
+        # ── Adaptive beta: suppress accel correction during linear motion ──
+        # If |accel| deviates from gravity, the body is accelerating linearly
+        # → accel no longer points at gravity → reduce its influence
+        self._accel_lp += self._accel_lp_alpha * (a_norm - self._accel_lp)
+        accel_dev = abs(a_norm - GRAVITY)
+
+        if self._sample_idx > self._warmup_samples:
+            if accel_dev > 1.5:
+                # Strong linear accel: trust only gyro
+                beta = beta * 0.01
+            elif accel_dev > 0.5:
+                # Moderate: scale down proportionally
+                scale = 1.0 - (accel_dev - 0.5) / 1.0
+                beta = beta * max(scale, 0.01)
+
+        # Normalize accelerometer
         if a_norm > 0.01:
             ax /= a_norm
             ay /= a_norm

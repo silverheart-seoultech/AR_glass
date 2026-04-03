@@ -327,7 +327,7 @@ class XREALAirIMU:
             f"[CAL] Done ({len(gyro_samples)} samples)\n"
             f"      Gyro bias: ({gyro_bias[0]:+.5f}, {gyro_bias[1]:+.5f}, {gyro_bias[2]:+.5f}) rad/s\n"
             f"      Gyro std:  ({gyro_std[0]:.5f}, {gyro_std[1]:.5f}, {gyro_std[2]:.5f}) rad/s\n"
-            f"      Init Roll: {math.degrees(roll):+.1f}°  Pitch: {math.degrees(pitch):+.1f}°\n"
+            f"      Init Roll: {math.degrees(pitch):+.1f}°  Pitch: {math.degrees(roll):+.1f}°\n"
             f"      |accel|:   {a_norm:.3f} m/s² (expect ~{GRAVITY:.3f})"
         )
 
@@ -534,7 +534,11 @@ class XREALAirIMU:
         cosy = 1.0 - 2.0 * (y * y + z * z)
         yaw = math.atan2(siny, cosy)
 
-        return np.array([math.degrees(roll), math.degrees(pitch), math.degrees(yaw)])
+        # Swap roll/pitch: glasses coordinate frame has gravity along
+        # the sensor's X-axis when worn, so the standard euler formula
+        # produces swapped roll/pitch.
+        # Output convention: [roll=side tilt, pitch=nod, yaw=turn]
+        return np.array([math.degrees(pitch), math.degrees(roll), math.degrees(yaw)])
 
     def _ekf_update(self, imu: IMUData) -> Orientation:
         """
